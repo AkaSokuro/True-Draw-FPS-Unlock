@@ -1,0 +1,26 @@
+build/*
+!build/TrueDrawFPS.ini
+
+# Game memory dumps and reverse-engineering data
+dump.bin
+*.dmp
+ghidra-proj/
+re/
+NOTES.md
+tools/
+
+# Runtime logs and replay traces
+*.log
+*.input
+*.trace-*.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
