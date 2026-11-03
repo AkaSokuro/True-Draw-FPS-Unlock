@@ -39,8 +39,22 @@ extern "C" void blendProp(const float* sim, float* packet) {
     memcpy(packet, sim, 64);
 }
 
+// Props with several models (the police helicopter: body and rotors) are also put on a model list, which is what
+// draws them: 14020C690(obj, list) calls 140518A70(list, world, models, count, id) at 14020C6C0 with the prop's
+// matrix (obj+50, the same matrix the copies above read). It copies the matrix once, so a blended copy on the stack
+// is enough.
+typedef void(__fastcall* ModelListFn)(void* list, const float* world, void* models, uint32_t count, uint64_t id);
+static u8* const CALL_MODEL_LIST = (u8*)0x14020C6C0;
+static const uintptr_t FN_MODEL_LIST = 0x140518A70;
+static void __fastcall modelListHook(void* list, const float* world, void* models, uint32_t count, uint64_t id) {
+    alignas(16) float m[16];
+    blendProp(world, m);
+    ((ModelListFn)FN_MODEL_LIST)(list, m, models, count, id);
+}
+
 void installProps() {
     if (!optObjects) return;
+    logf("prop model list %s", redirectCall(CALL_MODEL_LIST, FN_MODEL_LIST, (void*)modelListHook) ? "patched" : "NOT patched");
     int n = 0;
     for (int i = 0; i < 4; i++) {
         u8 orig[PROP_COPY_LEN];

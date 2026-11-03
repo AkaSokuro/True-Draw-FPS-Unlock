@@ -569,6 +569,44 @@ int main() {
         printf("%-14s slid back %d\n", "trail", ok);
         bad += !ok;
     }
+    { // mesh particles (glass, debris): Age locator at desc+C, Velocity halfway between Position and Age; moved back by
+      // velocity * (1 - alpha) steps, a particle younger than that hidden
+        alignas(16) static u8 desc[0x40], job[0x80];
+        alignas(16) static float pool[0x400 / 4];
+        *(uint32_t*)(desc + 4) = 0x20; *(uint32_t*)(desc + 0xC) = (2u << 18) | 0x360;
+        *(u8**)(job + 0x58) = (u8*)pool; *(uint32_t*)(job + 0x40) = 0; *(uint32_t*)(job + 0x44) = 2;
+        float *pos = pool + 0x20 / 4, *vel = pool + 0x1C0 / 4, *age = pool + 0x360 / 4;
+        pos[0] = 10; vel[0] = 60; age[0] = 1; pos[4] = 20; age[1] = 0.001f;
+        alpha = 0.5f; lookahead = 0; particleLogs = 100;
+        static float seen[8];
+        meshOrig = [](u8* d, u8* j) -> uint64_t { memcpy(seen, particleStream(d, j, 4, 16), 32); return 5; };
+        bool ok = meshHook(desc, job) == 5 && fabsf(seen[0] - 9.5f) < 1e-3f && seen[5] < -9e4f && pos[0] == 10;
+        printf("%-14s drawn time %d\n", "mesh", ok);
+        bad += !ok;
+    }
+    { // spark streak clock: the renderer gets drawn time (latest step's game time - (1 - alpha) steps), never going
+      // back; once game time stops while steps go on (photo mode), it stops at game time
+        static u8 clk[0x18];
+        clockOrig = [](void*) -> u8* { return clk; };
+        uint64_t& us = *(uint64_t*)(clk + 8);
+        auto drawnUs = [] { return *(uint64_t*)(renderClockHook(nullptr) + 8); };
+        lookahead = 0;
+        us = 1666600; stepCount = 100; alpha = 0.25f; uint64_t a = drawnUs();
+        alpha = 0.75f; uint64_t b = drawnUs();
+        alpha = 0.5f; uint64_t c = drawnUs();                              // earlier than b: stays at b
+        us += 16666; stepCount = 101; alpha = 0; uint64_t d = drawnUs();
+        stepCount = 103; alpha = 0.5f; uint64_t e = drawnUs();             // clock stopped 2 steps ago
+        bool ok = a == 1666600 - 12499 && b == 1666600 - 4166 && c == b && d == 1666600 && e == us && gameTimeRate == 0;
+        // stopped: particles drawn as they are (the renderer gets the game's own job)
+        static u8* seenJob; static u8 job[0x80];
+        ok &= drawAtDrawnTime([](u8*, u8* j) -> uint64_t { seenJob = j; return 3; }, nullptr, job, nullptr, nullptr, nullptr, 1, 5, "") == 3 && seenJob == job;
+        // slow motion: game time advances 16666 x scale per step, the drawn time goes back that much less
+        *(float*)(clk + 0x14) = 0.3f; us += 5000; stepCount = 104; alpha = 0.5f;
+        uint64_t f = drawnUs(); ok &= gameTimeRate == 0.3f && f == us - 2499;
+        *(float*)(clk + 0x14) = 1; gameTimeRate = 1;
+        printf("%-14s drawn time %d\n", "spark clock", ok);
+        bad += !ok;
+    }
     { // particle Position redirect: streams decoded like the game's renderers; Position from p, the other streams on the
       // same base and on the other base read the game's values, the game's data and job are unchanged
         static float scratch[0x400], pool[0x400];

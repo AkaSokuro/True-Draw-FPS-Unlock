@@ -15,6 +15,10 @@ static const u8 SPRITES_ORIG[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x50, 0x10}; // 
 typedef uint64_t(__fastcall* ParticleFn)(u8* desc, u8* job);
 static ParticleFn spritesOrig;
 static volatile long particleLogs;
+// How fast game time runs per simulation step (set by renderClockHook below): 1 normally, less in slow motion (the
+// game's time scale), 0 when it has stopped (paused, photo mode) while steps go on. Particles move that much slower,
+// so they are moved back by that much less; stopped ones are drawn as they are.
+static volatile float gameTimeRate = 1;
 
 // Copies n bytes; returns false if the source runs into memory that can't be read.
 static bool copySpan(void* to, const void* from, size_t n) {
@@ -25,9 +29,10 @@ static bool copySpan(void* to, const void* from, size_t n) {
     return ok;
 }
 
-// Finds a batch's position, velocity and age data. Returns false if the layout isn't the one we expect.
-static bool particleStreams(u8* desc, u8* job, float** pos, float** vel, float** age) {
-    uint32_t lp = *(uint32_t*)(desc + 4), la = *(uint32_t*)(desc + 8);
+// Finds a batch's position, velocity and age data (Position locator at desc+4, Age at desc+ageLoc).
+// Returns false if the layout isn't the one we expect.
+static bool particleStreams(u8* desc, u8* job, int ageLoc, float** pos, float** vel, float** age) {
+    uint32_t lp = *(uint32_t*)(desc + 4), la = *(uint32_t*)(desc + ageLoc);
     if ((lp >> 18) != 0 || (la >> 18) != 2 || (lp & 1) || (la & 1)) return false; // need Position and Age, both in the pool
     uint32_t op = lp & 0x3FFF0, oa = la & 0x3FFF0;
     if (oa <= op || (oa - op) % 32) return false;
@@ -128,7 +133,9 @@ extern "C" uint64_t trailHook(u8* desc, u8* job) {
 static uint64_t drawAtDrawnTime(ParticleFn fn, u8* desc, u8* job, const float* pos, const float* vel, const float* age,
                                 uint32_t n, int nloc, const char* what) {
     alignas(16) static thread_local float moved[4096 * 4];
-    float k = (1.0f - alpha - lookahead) * (float)STEP; // below 0 with lookahead: particles move forward, none hidden
+    if (gameTimeRate == 0) return fn(desc, job);
+    // Game time of the drawn moment before the latest step; below 0 with lookahead: particles move forward, none hidden
+    float k = (1.0f - alpha - lookahead) * (float)STEP * gameTimeRate;
     int hidden = 0;
     for (uint32_t i = 0; i < n; i++) {
         for (int c = 0; c < 4; c++) moved[i * 4 + c] = pos[i * 4 + c];
@@ -149,8 +156,19 @@ extern "C" uint64_t spritesHook(u8* desc, u8* job) {
     // Positions in scratch memory belong to effects placed at a car each step: move them with the car.
     if ((*(uint32_t*)(desc + 4) & 0xFFFC0001) == 1) return drawCarShifted(spritesOrig, desc, job, 4, 6, "sprites");
     float *pos, *vel, *age;
-    if (!n || n > 4096 || !particleStreams(desc, job, &pos, &vel, &age)) return spritesOrig(desc, job);
+    if (!n || n > 4096 || !particleStreams(desc, job, 8, &pos, &vel, &age)) return spritesOrig(desc, job);
     return drawAtDrawnTime(spritesOrig, desc, job, pos, vel, age, n, 6, "particles");
+}
+
+// Glass and debris (RenderMesh, 1400EF420; 1400EFBD0 and others jump to it). Same pool layout as the sprites, but
+// the Age locator is at desc+C. desc+4..+14 are locators (+8 rotation, +10 lifetime, +14 in scratch).
+static u8* const FN_MESH = (u8*)0x1400EF420;
+static ParticleFn meshOrig;
+extern "C" uint64_t meshHook(u8* desc, u8* job) {
+    uint32_t n = *(uint32_t*)(job + 0x44);
+    float *pos, *vel, *age;
+    if (!n || n > 4096 || !particleStreams(desc, job, 0xC, &pos, &vel, &age)) return meshOrig(desc, job);
+    return drawAtDrawnTime(meshOrig, desc, job, pos, vel, age, n, 5, "mesh particles");
 }
 
 // Sparks (RenderSpriteMotionBlur, 1400F0830): sprites stretched along their velocity.
@@ -167,6 +185,32 @@ extern "C" uint64_t motionBlurHook(u8* desc, u8* job) {
     const float* vel = (const float*)(pool + (lv & 0x3FFF0) + (uintptr_t)first * 16);
     const float* age = (const float*)(pool + (la & 0x3FFF0) + (uintptr_t)first * 4);
     return drawAtDrawnTime(motionBlurOrig, desc, job, pos, vel, age, n, 7, "motion blur sprites");
+}
+
+// The sparks' streaks reach back along a camera history the renderer keeps (1403A81A0, a view-projection matrix and
+// a time step per entry, copied into each emitter). It gets an entry every frame, but its time step is the game time
+// since the last frame: a whole step on frames with a step, 0 on the others (taken as paused: a default of 1/30 s).
+// So the streaks covered 1/60 to 1/30 s of spark movement, seen through one frame of camera movement, and stretched.
+// The time step comes from the game clock at 1403DE427 ([clock+8] = microseconds, 16666 per step); we hand it the
+// drawn time instead, so each entry is one frame apart. Once game time stops (paused, photo mode), it stops too.
+typedef u8*(__fastcall* ClockFn)(void* owner);
+static u8* const CALL_RENDER_CLOCK = (u8*)0x1403DE427;
+static const uintptr_t FN_CLOCK = 0x1405130E0;
+static ClockFn clockOrig = (ClockFn)FN_CLOCK;
+static u8* __fastcall renderClockHook(void* owner) {
+    static u8 drawn[0x18];
+    static uint64_t lastUs, movedStep, drawnUs;
+    u8* clock = clockOrig(owner);
+    uint64_t us = *(uint64_t*)(clock + 8), step = (uint64_t)stepCount, t = us;
+    if (us != lastUs) { lastUs = us; movedStep = step; }
+    float scale = *(float*)(clock + 0x14); // [clock+8] advances 16666 x scale per step
+    gameTimeRate = movedStep + 1 < step ? 0 : scale > 0 && scale <= 4 ? scale : 1;
+    t = us - (int64_t)((1.0f - alpha - lookahead) * 16666 * gameTimeRate);
+    // Never back in time (a negative step), unless the clock itself went back (a new session).
+    if (t > drawnUs || us + 1000000 < drawnUs) drawnUs = t;
+    memcpy(drawn, clock, sizeof drawn);
+    *(uint64_t*)(drawn + 8) = drawnUs;
+    return drawn;
 }
 
 // ---- Player headlight pool (gPlayerHeadlight) ----
@@ -239,8 +283,10 @@ void installEffects() {
     if (optObjects) logf("car lights %s", redirectCall(CALL_LIGHT, FN_LIGHT, (void*)lightHook) ? "patched" : "NOT patched");
     const struct { u8* fn; ParticleFn* orig; void* hook; } particleHooks[] = {
         {FN_SPRITES, &spritesOrig, (void*)spritesHook}, {FN_ATTACHED, &attachedOrig, (void*)attachedHook},
-        {FN_TRAIL, &trailOrig, (void*)trailHook}, {FN_MOTIONBLUR, &motionBlurOrig, (void*)motionBlurHook}};
-    for (int i = 0; i < 4 && optParticles; i++) {
+        {FN_TRAIL, &trailOrig, (void*)trailHook}, {FN_MOTIONBLUR, &motionBlurOrig, (void*)motionBlurHook},
+        {FN_MESH, &meshOrig, (void*)meshHook}};
+    if (optParticles) logf("spark streak clock %s", redirectCall(CALL_RENDER_CLOCK, FN_CLOCK, (void*)renderClockHook) ? "patched" : "NOT patched");
+    for (int i = 0; i < 5 && optParticles; i++) {
         const auto& ph = particleHooks[i];
         if (memcmp(ph.fn, SPRITES_ORIG, sizeof SPRITES_ORIG) != 0) { logf("particle renderer %p NOT patched", ph.fn); continue; }
         // Keep a way to call the original: its first 7 bytes, copied elsewhere, followed by a jump back.

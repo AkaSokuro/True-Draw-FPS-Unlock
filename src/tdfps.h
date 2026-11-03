@@ -10,7 +10,7 @@
 #include <malloc.h>
 #include <initializer_list>
 
-#define TDFPS_VERSION "v0.79"
+#define TDFPS_VERSION "v1.0"
 typedef uint8_t u8;
 
 // ---- log.cpp ----
